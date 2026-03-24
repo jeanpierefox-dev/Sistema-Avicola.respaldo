@@ -1,0 +1,1435 @@
+
+import React, { useState, useEffect, useRef, useContext } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { WeighingType, ClientOrder, WeighingRecord, UserRole } from '../../types';
+import { getOrders, saveOrder, getConfig, deleteOrder, getBatches } from '../../services/storage';
+import { 
+  ArrowLeft, Save, X, Eye, Package, PackageOpen, 
+  User, Trash2, Box, UserPlus, Bird, Printer, Receipt, 
+  Activity, Download, List, ChevronRight, Scale, ChevronDown, FileText, Edit2
+} from 'lucide-react';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import { AuthContext } from '../../App';
+
+const WeighingStation: React.FC = () => {
+  const { mode, batchId } = useParams<{ mode: string; batchId?: string }>();
+  const navigate = useNavigate();
+  const [config] = useState(getConfig());
+  const { user } = useContext(AuthContext);
+
+  const [activeOrder, setActiveOrder] = useState<ClientOrder | null>(null);
+  const [orders, setOrders] = useState<ClientOrder[]>([]);
+  
+  const [showClientModal, setShowClientModal] = useState(false);
+  const [orderToDelete, setOrderToDelete] = useState<ClientOrder | null>(null);
+  const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [showDetailModal, setShowDetailModal] = useState(false);
+  
+  const [editingOrderId, setEditingOrderId] = useState<string | null>(null);
+  const [newClientName, setNewClientName] = useState('');
+  const [targetCrates, setTargetCrates] = useState<string>(''); 
+  const [newClientBirdsPerCrate, setNewClientBirdsPerCrate] = useState('10');
+
+  const [weightInput, setWeightInput] = useState('');
+  const [qtyInput, setQtyInput] = useState('');
+  const [birdsPerCrate, setBirdsPerCrate] = useState('10'); // Default 10 birds per crate
+  const [activeTab, setActiveTab] = useState<'FULL' | 'EMPTY' | 'MORTALITY'>('FULL');
+  const weightInputRef = useRef<HTMLInputElement>(null);
+
+  const [pricePerKg, setPricePerKg] = useState<number | string>('');
+  const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'CREDIT'>('CASH');
+
+  useEffect(() => {
+    loadOrders();
+    const handleUpdate = () => loadOrders();
+    window.addEventListener('avi_data_orders', handleUpdate);
+    return () => window.removeEventListener('avi_data_orders', handleUpdate);
+  }, [mode, batchId]);
+
+  useEffect(() => {
+    setDefaultQuantity();
+    const timeout = setTimeout(() => weightInputRef.current?.focus(), 200);
+    return () => clearTimeout(timeout);
+  }, [activeTab, activeOrder]);
+
+  const loadOrders = () => {
+    const all = getOrders();
+    let filtered = mode === WeighingType.BATCH && batchId 
+      ? all.filter(o => o.batchId === batchId) 
+      : all.filter(o => !o.batchId && o.weighingMode === mode);
+    
+    if (user?.role !== UserRole.ADMIN) {
+      filtered = filtered.filter(o => !o.createdBy || o.createdBy === user?.id);
+    }
+    
+    filtered.sort((a, b) => (a.status === 'OPEN' ? -1 : 1));
+    setOrders(filtered);
+  };
+
+  const setDefaultQuantity = () => {
+    if (mode === WeighingType.SOLO_POLLO) { setQtyInput('10'); setBirdsPerCrate('1'); }
+    else if (mode === WeighingType.SOLO_JABAS) { setQtyInput('1'); setBirdsPerCrate('0'); }
+    else {
+      if (activeTab === 'FULL') { 
+        setQtyInput(config.defaultFullCrateBatch.toString()); 
+        setBirdsPerCrate(activeOrder?.birdsPerCrate?.toString() || '10'); 
+      }
+      if (activeTab === 'EMPTY') { setQtyInput('10'); setBirdsPerCrate('0'); }
+      if (activeTab === 'MORTALITY') { setQtyInput('1'); setBirdsPerCrate('1'); }
+    }
+  };
+
+  const handleDeleteClient = (order: ClientOrder) => {
+    setOrderToDelete(order);
+  };
+
+  const confirmDeleteClient = () => {
+    if (!orderToDelete) return;
+    deleteOrder(orderToDelete.id);
+    if (activeOrder?.id === orderToDelete.id) {
+      setActiveOrder(null);
+    }
+    loadOrders();
+    setOrderToDelete(null);
+  };
+
+  const handleOpenClientModal = (order?: ClientOrder) => {
+    if (order) {
+      setEditingOrderId(order.id);
+      setNewClientName(order.clientName);
+      setTargetCrates(order.targetCrates?.toString() || '');
+      setNewClientBirdsPerCrate(order.birdsPerCrate?.toString() || '10');
+    } else {
+      setEditingOrderId(null);
+      setNewClientName('');
+      setTargetCrates('');
+      setNewClientBirdsPerCrate('10');
+    }
+    setShowClientModal(true);
+  };
+
+  const handleSaveClient = () => {
+    if (!newClientName || !targetCrates) return;
+    const target = parseInt(targetCrates);
+    const birds = parseInt(newClientBirdsPerCrate) || 10;
+
+    // Check if there's already an open order for this client
+    if (!editingOrderId) {
+        const existingOpenOrder = getOrders().find(o => o.clientName.toLowerCase() === newClientName.toLowerCase() && o.status === 'OPEN' && o.weighingMode === mode && o.batchId === batchId);
+        if (existingOpenOrder) {
+            setActiveOrder(existingOpenOrder);
+            setShowClientModal(false);
+            return;
+        }
+    }
+
+    // Check Batch Limit
+    if (mode === WeighingType.BATCH && batchId) {
+        const batch = getBatches().find(b => b.id === batchId);
+        if (batch) {
+            const currentOrders = getOrders().filter(o => o.batchId === batchId && o.id !== editingOrderId);
+            const usedCrates = currentOrders.reduce((acc, o) => acc + (o.targetCrates || 0), 0);
+            
+            if (usedCrates + target > batch.totalCratesLimit) {
+                alert(`¡Límite de Lote Excedido!\n\nCapacidad Total: ${batch.totalCratesLimit}\nUsado: ${usedCrates}\nIntentando agregar: ${target}\nDisponible: ${batch.totalCratesLimit - usedCrates}`);
+                return;
+            }
+        }
+    }
+
+    if (editingOrderId) {
+      const existing = getOrders().find(o => o.id === editingOrderId);
+      if (existing) {
+          const updatedRecords = existing.records.map(r => {
+              if (r.type === 'FULL') {
+                  return { ...r, birds: r.quantity * birds };
+              }
+              return r;
+          });
+          const updatedOrder = { ...existing, clientName: newClientName, targetCrates: target, birdsPerCrate: birds, records: updatedRecords };
+          saveOrder(updatedOrder);
+          if (activeOrder?.id === editingOrderId) {
+              setActiveOrder(updatedOrder);
+          }
+      }
+    } else {
+      const newOrder: ClientOrder = {
+        id: Date.now().toString(), clientName: newClientName, targetCrates: target, birdsPerCrate: birds,
+        pricePerKg: 0, status: 'OPEN', records: [], batchId, weighingMode: mode as WeighingType,
+        paymentStatus: 'PENDING', payments: [], createdBy: user?.id
+      };
+      saveOrder(newOrder);
+    }
+    loadOrders();
+    setShowClientModal(false);
+  };
+
+  const getTotals = (order: ClientOrder) => {
+    const full = order.records.filter(r => r.type === 'FULL');
+    const empty = order.records.filter(r => r.type === 'EMPTY');
+    const mort = order.records.filter(r => r.type === 'MORTALITY');
+    
+    const wF = full.reduce((a, b) => a + b.weight, 0);
+    const wE = empty.reduce((a, b) => a + b.weight, 0);
+    const wM = mort.reduce((a, b) => a + b.weight, 0);
+    
+    const qF = full.reduce((a, b) => a + b.quantity, 0); // Total Crates Full
+    const qE = empty.reduce((a, b) => a + b.quantity, 0); // Total Crates Empty
+    const qM = mort.reduce((a, b) => a + b.quantity, 0); // Total Mortality Count (birds usually)
+    
+    // Calculate total birds
+    // If birds property exists, use it. Otherwise fallback to quantity * 10 (legacy) or just quantity if SOLO_POLLO
+    const bF = full.reduce((a, b) => a + (b.birds !== undefined ? b.birds : (order.weighingMode === WeighingType.SOLO_POLLO ? b.quantity : b.quantity * 10)), 0);
+    
+    const net = order.weighingMode === WeighingType.SOLO_POLLO ? wF : wF - wE - wM;
+    
+    // Count of weights (records)
+    const cF = full.length;
+    const cE = empty.length;
+    const cM = mort.length;
+
+    return { wF, wE, wM, qF, qE, qM, bF, net, cF, cE, cM };
+  };
+
+  const addWeight = () => {
+    if (!activeOrder || !weightInput || !qtyInput) return;
+    
+    const quantity = parseInt(qtyInput);
+    
+    // Check target crates limit
+    if (activeOrder.targetCrates > 0) {
+        if (activeTab === 'FULL') {
+            const currentFull = activeOrder.records.filter(r => r.type === 'FULL').reduce((a, b) => a + b.quantity, 0);
+            if (currentFull + quantity > activeOrder.targetCrates) {
+                alert(`¡Límite de jabas llenas excedido! La meta es ${activeOrder.targetCrates} y ya tiene ${currentFull}.`);
+                return;
+            }
+        }
+        if (activeTab === 'EMPTY') {
+            const currentEmpty = activeOrder.records.filter(r => r.type === 'EMPTY').reduce((a, b) => a + b.quantity, 0);
+            if (currentEmpty + quantity > activeOrder.targetCrates) {
+                alert(`¡Límite de jabas vacías excedido! La meta es ${activeOrder.targetCrates} y ya tiene ${currentEmpty}.`);
+                return;
+            }
+        }
+    }
+
+    const birds = activeTab === 'FULL' ? quantity * parseInt(birdsPerCrate || '0') : (activeTab === 'MORTALITY' ? quantity : 0);
+
+    const record: WeighingRecord = {
+      id: Date.now().toString(), timestamp: Date.now(), weight: parseFloat(weightInput),
+      quantity: quantity, 
+      birds: birds,
+      type: activeTab
+    };
+    const updated = { ...activeOrder, records: [record, ...activeOrder.records] };
+    saveOrder(updated);
+    setActiveOrder(updated);
+    setOrders(prev => prev.map(o => o.id === updated.id ? updated : o));
+    setWeightInput('');
+    weightInputRef.current?.focus();
+  };
+
+  const deleteRecord = (id: string) => {
+    if(!confirm('¿Eliminar registro?')) return;
+    const updated = { ...activeOrder!, records: activeOrder!.records.filter(r => r.id !== id) };
+    saveOrder(updated);
+    setActiveOrder(updated);
+    setOrders(prev => prev.map(o => o.id === updated.id ? updated : o));
+  };
+
+  const handlePDFOutput = (doc: jsPDF, filename: string) => {
+    doc.save(filename);
+  };
+
+  const chunkArray = (array: any[], size: number) => {
+    const chunked = [];
+    for (let i = 0; i < array.length; i += size) {
+      chunked.push(array.slice(i, i + size));
+    }
+    return chunked;
+  };
+
+  const renderTicketContent = (doc: jsPDF, order: ClientOrder, isSalesTicket: boolean) => {
+    const t = getTotals(order);
+    const batch = getBatches().find(b => b.id === order.batchId);
+    const batchName = batch ? batch.name : 'Venta Directa';
+    
+    let y = 10;
+    
+    // Header
+    if (config.logoUrl) {
+        doc.addImage(config.logoUrl, 'PNG', 25, y, 30, 30);
+        y += 35;
+    }
+
+    doc.setFontSize(14).setFont("helvetica", "bold");
+    doc.text(config.companyName.toUpperCase(), 40, y, { align: 'center' });
+    y += 5;
+    
+    doc.setFontSize(9).setFont("helvetica", "normal");
+    doc.text(isSalesTicket ? "TICKET DE VENTA" : "TICKET DE PESAJE", 40, y, { align: 'center' });
+    y += 5;
+    
+    doc.setFontSize(8).setFont("helvetica", "italic");
+    doc.text(`FECHA: ${new Date().toLocaleString()}`, 40, y, { align: 'center' });
+    y += 5;
+    doc.setDrawColor(0);
+    doc.setLineWidth(0.5);
+    doc.line(5, y, 75, y);
+    y += 5;
+
+    // Batch & Client Info
+    doc.setFontSize(9).setFont("helvetica", "bold");
+    doc.text(`LOTE:`, 5, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(batchName.toUpperCase(), 20, y);
+    y += 5;
+    doc.setFont("helvetica", "bold");
+    doc.text(`CLIENTE:`, 5, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(order.clientName.toUpperCase(), 22, y);
+    y += 6;
+
+    if (!isSalesTicket) {
+        // Quantities Box
+        autoTable(doc, {
+            startY: y,
+            head: [[{ content: 'RESUMEN DE CANTIDADES', colSpan: 2, styles: { halign: 'center', fillColor: [220, 226, 230], textColor: 0 } }]],
+            body: [
+                ['Jabas Llenas:', t.qF.toString()],
+                ['Total Pollos:', t.bF.toString()],
+                ['Jabas Vacías:', t.qE.toString()],
+                ['Pollos Muertos:', t.qM.toString()]
+            ],
+            theme: 'grid',
+            styles: { fontSize: 8, cellPadding: 1.5 },
+            columnStyles: {
+                0: { fontStyle: 'bold', cellWidth: 40 },
+                1: { halign: 'right', cellWidth: 30 }
+            },
+            margin: { left: 5, right: 5 }
+        });
+        y = (doc as any).lastAutoTable.finalY + 5;
+
+        // DETAILED RECORDS TABLE
+        doc.setFontSize(10).setFont("helvetica", "bold");
+        doc.text("DETALLE DE PESOS", 40, y, { align: 'center' });
+        y += 2;
+
+        const fullRecords = order.records.filter(r => r.type === 'FULL').sort((a, b) => b.timestamp - a.timestamp);
+        const emptyRecords = order.records.filter(r => r.type === 'EMPTY').sort((a, b) => b.timestamp - a.timestamp);
+        const mortRecords = order.records.filter(r => r.type === 'MORTALITY').sort((a, b) => b.timestamp - a.timestamp);
+
+        const renderCategory = (title: string, records: any[], totalWeight: number, qty?: number) => {
+            if (records.length === 0) return;
+            
+            const headerText = qty !== undefined ? `${title} (Cant: ${qty})` : title;
+            
+            autoTable(doc, {
+                startY: y,
+                head: [[{ content: headerText, colSpan: 4, styles: { halign: 'center', fillColor: [220, 226, 230], textColor: 0 } }]],
+                body: chunkArray(records.flatMap(r => {
+                    let suffix = '';
+                    if (r.type === 'FULL') suffix = `${r.quantity}j, ${r.birds}p`;
+                    else if (r.type === 'EMPTY') suffix = `${r.quantity}j`;
+                    else if (r.type === 'MORTALITY') suffix = `${r.quantity}p`;
+                    return [r.weight.toFixed(2), suffix];
+                }), 4),
+                theme: 'grid',
+                styles: { fontSize: 7, cellPadding: 1, halign: 'center', minCellHeight: 6 },
+                margin: { left: 5, right: 5 },
+                tableWidth: 70
+            });
+            y = (doc as any).lastAutoTable.finalY + 1;
+            
+            doc.setFontSize(8).setFont("helvetica", "bold");
+            doc.text(`TOTAL ${title}:`, 40, y + 3, { align: 'right' });
+            doc.text(`${totalWeight.toFixed(2)} kg`, 72, y + 3, { align: 'right' });
+            y += 7;
+        };
+
+        renderCategory("LLENAS", fullRecords, t.wF, t.qF);
+        renderCategory("VACÍAS", emptyRecords, t.wE, t.qE);
+        renderCategory("MORTALIDAD", mortRecords, t.wM, t.qM);
+    }
+
+    y += 2;
+    doc.setDrawColor(0);
+    doc.setLineWidth(0.5);
+    doc.line(5, y, 75, y);
+    y += 6;
+
+    // Final Totals
+    doc.setFontSize(9).setFont("helvetica", "normal");
+    doc.text("Peso Bruto:", 8, y); doc.text(`${t.wF.toFixed(2)} kg`, 72, y, { align: 'right' }); y += 5;
+    doc.text("Tara Total:", 8, y); doc.text(`-${t.wE.toFixed(2)} kg`, 72, y, { align: 'right' }); y += 5;
+    doc.text("Mortalidad:", 8, y); doc.text(`-${t.wM.toFixed(2)} kg`, 72, y, { align: 'right' }); y += 5;
+    
+    doc.setFontSize(11).setFont("helvetica", "bold");
+    doc.text("PESO NETO:", 8, y + 2);
+    doc.text(`${t.net.toFixed(2)} kg`, 72, y + 2, { align: 'right' });
+    y += 10;
+
+    // Financials
+    if (order.pricePerKg > 0) {
+        doc.setFontSize(9).setFont("helvetica", "bold");
+        doc.text(`PRECIO X KG: S/. ${order.pricePerKg.toFixed(2)}`, 5, y);
+        y += 6;
+        
+        doc.setFillColor(15, 23, 42); // Slate 900
+        doc.rect(5, y, 70, 12, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(9).setFont("helvetica", "bold");
+        doc.text("TOTAL A PAGAR", 35, y + 7, { align: 'right' });
+        doc.setFontSize(12);
+        doc.text(`S/. ${(t.net * order.pricePerKg).toFixed(2)}`, 72, y + 8, { align: 'right' });
+        doc.setTextColor(0, 0, 0);
+        y += 18;
+    }
+
+    doc.setFontSize(8).setFont("helvetica", "italic");
+    doc.text("¡Gracias por su preferencia!", 40, y, { align: 'center' });
+    
+    return y + 10;
+  };
+
+  const generateWeighingTicketPDF = (order: ClientOrder) => {
+    // Pass 1: Calculate height
+    const dummyDoc = new jsPDF({ unit: 'mm', format: [80, 1000] });
+    const finalY = renderTicketContent(dummyDoc, order, false);
+    
+    // Pass 2: Render with exact height
+    const doc = new jsPDF({ unit: 'mm', format: [80, finalY] });
+    renderTicketContent(doc, order, false);
+    handlePDFOutput(doc, `Pesaje_${order.clientName}_${order.id.slice(-6)}.pdf`);
+  };
+
+  const renderSalesTicketContent = (doc: jsPDF, order: ClientOrder) => {
+    const t = getTotals(order);
+    const batch = getBatches().find(b => b.id === order.batchId);
+    const batchName = batch ? batch.name : 'Venta Directa';
+    
+    let y = 10;
+    
+    // Header
+    if (config.logoUrl) {
+        doc.addImage(config.logoUrl, 'PNG', 25, y, 30, 30);
+        y += 35;
+    }
+
+    doc.setFontSize(14).setFont("helvetica", "bold");
+    doc.text(config.companyName.toUpperCase(), 40, y, { align: 'center' });
+    y += 5;
+    
+    doc.setFontSize(10).setFont("helvetica", "bold");
+    doc.text("TICKET DE VENTA", 40, y, { align: 'center' });
+    y += 5;
+    
+    doc.setFontSize(8).setFont("helvetica", "italic");
+    doc.text(`FECHA: ${new Date().toLocaleString()}`, 40, y, { align: 'center' });
+    y += 5;
+    doc.setDrawColor(0);
+    doc.setLineWidth(0.5);
+    doc.line(5, y, 75, y);
+    y += 5;
+
+    // Batch & Client Info
+    doc.setFontSize(9).setFont("helvetica", "bold");
+    doc.text(`LOTE:`, 5, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(batchName.toUpperCase(), 20, y);
+    y += 5;
+    doc.setFont("helvetica", "bold");
+    doc.text(`CLIENTE:`, 5, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(order.clientName.toUpperCase(), 22, y);
+    y += 6;
+
+    // General Weights Box
+    autoTable(doc, {
+        startY: y,
+        head: [[{ content: 'RESUMEN DE PESOS', colSpan: 2, styles: { halign: 'center', fillColor: [220, 226, 230], textColor: 0 } }]],
+        body: [
+            ['Peso Bruto:', `${t.wF.toFixed(2)} kg`],
+            ['Tara Total:', `-${t.wE.toFixed(2)} kg`],
+            ['Mortalidad:', `-${t.wM.toFixed(2)} kg`],
+            ['PESO NETO:', `${t.net.toFixed(2)} kg`]
+        ],
+        theme: 'grid',
+        styles: { fontSize: 9, cellPadding: 2 },
+        columnStyles: {
+            0: { fontStyle: 'bold', cellWidth: 35 },
+            1: { halign: 'right', cellWidth: 35 }
+        },
+        margin: { left: 5, right: 5 }
+    });
+    y = (doc as any).lastAutoTable.finalY + 8;
+
+    // Financials
+    if (order.pricePerKg > 0) {
+        doc.setFontSize(9).setFont("helvetica", "bold");
+        doc.text(`PRECIO X KG: S/. ${order.pricePerKg.toFixed(2)}`, 5, y);
+        y += 6;
+        
+        doc.setFillColor(15, 23, 42); // Slate 900
+        doc.rect(5, y, 70, 15, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(10).setFont("helvetica", "bold");
+        doc.text("TOTAL A PAGAR", 35, y + 9, { align: 'right' });
+        doc.setFontSize(14);
+        doc.text(`S/. ${(t.net * order.pricePerKg).toFixed(2)}`, 72, y + 10, { align: 'right' });
+        doc.setTextColor(0, 0, 0);
+        y += 22;
+    }
+
+    doc.setFontSize(8).setFont("helvetica", "italic");
+    doc.text("¡Gracias por su compra!", 40, y, { align: 'center' });
+
+    return y + 10;
+  };
+
+  const generateSalesTicketPDF = (order: ClientOrder) => {
+    // Pass 1: Calculate height
+    const dummyDoc = new jsPDF({ unit: 'mm', format: [80, 1000] });
+    const finalY = renderSalesTicketContent(dummyDoc, order);
+    
+    // Pass 2: Render with exact height
+    const doc = new jsPDF({ unit: 'mm', format: [80, finalY] });
+    renderSalesTicketContent(doc, order);
+    handlePDFOutput(doc, `Venta_${order.clientName}_${order.id.slice(-6)}.pdf`);
+  };
+
+  const generateDetailPDF = (order: ClientOrder) => {
+    const t = getTotals(order);
+    const batch = getBatches().find(b => b.id === order.batchId);
+    const batchName = batch ? batch.name : 'Venta Directa';
+    const doc = new jsPDF();
+    
+    // Header Background
+    doc.setFillColor(15, 23, 42); // Slate 900
+    doc.rect(0, 0, 210, 45, 'F');
+    
+    // Header Text
+    if (config.logoUrl) {
+        doc.addImage(config.logoUrl, 'PNG', 14, 10, 25, 25);
+    }
+
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(22).setFont("helvetica", "bold");
+    doc.text(config.companyName.toUpperCase(), 105, 20, { align: 'center' });
+    
+    doc.setFontSize(12).setFont("helvetica", "normal");
+    doc.text("REPORTE DETALLADO DE PESAJE", 105, 30, { align: 'center' });
+    
+    doc.setTextColor(0, 0, 0);
+    
+    let y = 55;
+    
+    // Client Info
+    doc.setFontSize(10).setFont("helvetica", "bold");
+    doc.text(`LOTE:`, 14, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(batchName.toUpperCase(), 35, y);
+    
+    doc.setFont("helvetica", "bold");
+    doc.text(`FECHA:`, 140, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(new Date().toLocaleString(), 155, y);
+    
+    y += 7;
+    doc.setFont("helvetica", "bold");
+    doc.text(`CLIENTE:`, 14, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(order.clientName.toUpperCase(), 35, y);
+    
+    doc.setFont("helvetica", "bold");
+    doc.text(`TICKET ID:`, 140, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(order.id, 160, y);
+
+    // Summary Table
+    autoTable(doc, {
+        startY: y + 10,
+        head: [['CONCEPTO', 'CANTIDAD', 'DETALLE', 'PESO TOTAL (KG)']],
+        body: [
+            ['Jabas Llenas (Bruto)', t.qF, `${t.bF} Pollos`, t.wF.toFixed(2)],
+            ['Jabas Vacías (Tara)', t.qE, '-', `-${t.wE.toFixed(2)}`],
+            ['Mortalidad (Pollos Muertos)', t.qM, '-', `-${t.wM.toFixed(2)}`],
+            [{ content: 'PESO NETO FINAL', colSpan: 3, styles: { halign: 'right', fontStyle: 'bold', fontSize: 11 } }, { content: t.net.toFixed(2), styles: { fontStyle: 'bold', fontSize: 11, fillColor: [240, 253, 244], textColor: [21, 128, 61] } }]
+        ],
+        theme: 'grid',
+        headStyles: { fillColor: [30, 41, 59], textColor: 255, fontStyle: 'bold' },
+        styles: { fontSize: 10, cellPadding: 4 },
+        columnStyles: {
+            0: { fontStyle: 'bold' },
+            3: { halign: 'right', fontStyle: 'bold' }
+        }
+    });
+
+    y = (doc as any).lastAutoTable.finalY + 15;
+    
+    doc.setFontSize(14).setFont("helvetica", "bold");
+    doc.text("DESGLOSE DE PESADAS", 14, y);
+    y += 5;
+
+    const fullRecords = order.records.filter(r => r.type === 'FULL').sort((a, b) => b.timestamp - a.timestamp);
+    const emptyRecords = order.records.filter(r => r.type === 'EMPTY').sort((a, b) => b.timestamp - a.timestamp);
+    const mortRecords = order.records.filter(r => r.type === 'MORTALITY').sort((a, b) => b.timestamp - a.timestamp);
+
+    const renderCategoryGridA4 = (title: string, records: any[], totalWeight: number, qty?: number) => {
+        if (records.length === 0) return;
+        y = (doc as any).lastAutoTable ? (doc as any).lastAutoTable.finalY + 8 : y + 5;
+        if (y > 250) { doc.addPage(); y = 20; }
+        
+        const headerText = qty !== undefined 
+            ? `${title} - CANTIDAD: ${qty} | TOTAL: ${totalWeight.toFixed(2)} KG`
+            : `${title} - TOTAL: ${totalWeight.toFixed(2)} KG`;
+
+        autoTable(doc, {
+            startY: y,
+            head: [[{ content: headerText, colSpan: 8, styles: { halign: 'left', fillColor: [241, 245, 249], textColor: 0, fontStyle: 'bold' } }]],
+            body: chunkArray(records.flatMap(r => {
+                let suffix = '';
+                if (r.type === 'FULL') suffix = `${r.quantity}j, ${r.birds}p`;
+                else if (r.type === 'EMPTY') suffix = `${r.quantity}j`;
+                else if (r.type === 'MORTALITY') suffix = `${r.quantity}p`;
+                return [r.weight.toFixed(2), suffix];
+            }), 8),
+            theme: 'grid',
+            styles: { fontSize: 8, halign: 'center', cellPadding: 2, minCellHeight: 8 },
+            margin: { left: 14, right: 14 }
+        });
+    };
+
+    renderCategoryGridA4("JABAS LLENAS", fullRecords, t.wF, t.qF);
+    renderCategoryGridA4("JABAS VACÍAS", emptyRecords, t.wE, t.qE);
+    renderCategoryGridA4("MORTALIDAD", mortRecords, t.wM, t.qM);
+    
+    // Footer
+    const pageCount = (doc as any).internal.getNumberOfPages();
+    for(let i = 1; i <= pageCount; i++) {
+        doc.setPage(i);
+        doc.setFontSize(8).setTextColor(150);
+        doc.text(`Generado por AviControl Pro - Página ${i} de ${pageCount}`, 105, 290, { align: 'center' });
+    }
+
+    handlePDFOutput(doc, `Reporte_A4_${order.clientName}_${order.id}.pdf`);
+  };
+
+  const generateBatchReportPDF = () => {
+    const batchOrders = orders;
+    let totalFull = 0, totalEmpty = 0, totalNet = 0, totalMort = 0;
+    
+    batchOrders.forEach(o => {
+      const stats = getTotals(o);
+      totalFull += stats.wF;
+      totalEmpty += stats.wE;
+      totalMort += stats.wM;
+      totalNet += stats.net;
+    });
+
+    const doc = new jsPDF('landscape');
+    
+    // Header Background
+    doc.setFillColor(15, 23, 42); // Slate 900
+    doc.rect(0, 0, 297, 40, 'F');
+    
+    // Header Text
+    if (config.logoUrl) {
+        doc.addImage(config.logoUrl, 'PNG', 14, 8, 24, 24);
+    }
+
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(20).setFont("helvetica", "bold");
+    doc.text(config.companyName.toUpperCase(), 148.5, 18, { align: 'center' });
+    
+    doc.setFontSize(12).setFont("helvetica", "normal");
+    doc.text("ESTADO DE CUENTA GENERAL DEL LOTE", 148.5, 28, { align: 'center' });
+    
+    doc.setTextColor(0, 0, 0);
+    
+    let y = 50;
+    
+    // Batch Info
+    const batch = getBatches().find(b => b.id === batchId);
+    const batchName = batch ? batch.name : 'Venta Directa';
+
+    doc.setFontSize(10).setFont("helvetica", "bold");
+    doc.text(`LOTE:`, 14, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(batchName.toUpperCase(), 30, y);
+    
+    doc.setFont("helvetica", "bold");
+    doc.text(`FECHA DE REPORTE:`, 220, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(new Date().toLocaleString(), 260, y);
+    
+    y += 10;
+
+    // Table Data Preparation
+    const tableData = batchOrders.map((order: ClientOrder) => {
+        const t = getTotals(order);
+        const price = order.pricePerKg || 0;
+        const totalAmount = t.net * price;
+        const totalPaid = order.payments?.reduce((sum, p) => sum + p.amount, 0) || 0;
+        const balance = totalAmount - totalPaid;
+
+        return [
+            order.clientName.toUpperCase(),
+            t.qF.toString(),
+            t.bF.toString(),
+            t.wF.toFixed(2),
+            t.wE.toFixed(2),
+            t.wM.toFixed(2),
+            t.net.toFixed(2),
+            `S/ ${price.toFixed(2)}`,
+            `S/ ${totalAmount.toFixed(2)}`,
+            `S/ ${totalPaid.toFixed(2)}`,
+            `S/ ${balance.toFixed(2)}`
+        ];
+    });
+
+    // Calculate totals for footer
+    let sumNet = 0, sumAmount = 0, sumPaid = 0, sumBalance = 0;
+    batchOrders.forEach((order: ClientOrder) => {
+        const t = getTotals(order);
+        const price = order.pricePerKg || 0;
+        const totalAmount = t.net * price;
+        const totalPaid = order.payments?.reduce((sum, p) => sum + p.amount, 0) || 0;
+        sumNet += t.net;
+        sumAmount += totalAmount;
+        sumPaid += totalPaid;
+        sumBalance += totalAmount - totalPaid;
+    });
+
+    tableData.push([
+        { content: 'TOTALES', styles: { fontStyle: 'bold', halign: 'right' } },
+        '-',
+        '-',
+        totalFull.toFixed(2),
+        totalEmpty.toFixed(2),
+        totalMort.toFixed(2),
+        { content: sumNet.toFixed(2), styles: { fontStyle: 'bold' } },
+        '-',
+        { content: `S/ ${sumAmount.toFixed(2)}`, styles: { fontStyle: 'bold' } },
+        { content: `S/ ${sumPaid.toFixed(2)}`, styles: { fontStyle: 'bold' } },
+        { content: `S/ ${sumBalance.toFixed(2)}`, styles: { fontStyle: 'bold' } }
+    ]);
+
+    autoTable(doc, {
+        startY: y,
+        head: [['CLIENTE', 'JABAS', 'POLLOS', 'BRUTO (KG)', 'TARA (KG)', 'MERMA (KG)', 'NETO (KG)', 'PRECIO/KG', 'MONTO TOTAL', 'ABONADO', 'SALDO']],
+        body: tableData,
+        theme: 'grid',
+        headStyles: { fillColor: [30, 41, 59], textColor: 255, fontStyle: 'bold', fontSize: 8, halign: 'center' },
+        styles: { fontSize: 8, cellPadding: 3, halign: 'center' },
+        columnStyles: {
+            0: { halign: 'left', fontStyle: 'bold', cellWidth: 40 },
+            6: { fontStyle: 'bold', textColor: [21, 128, 61] }, // Neto
+            8: { fontStyle: 'bold' }, // Monto Total
+            10: { fontStyle: 'bold', textColor: [185, 28, 28] } // Saldo
+        }
+    });
+
+    // Footer
+    const pageCount = (doc as any).internal.getNumberOfPages();
+    for(let i = 1; i <= pageCount; i++) {
+        doc.setPage(i);
+        doc.setFontSize(8).setTextColor(150);
+        doc.text(`Generado por AviControl Pro - Página ${i} de ${pageCount}`, 148.5, 200, { align: 'center' });
+    }
+
+    handlePDFOutput(doc, `Reporte_Lote_${batchName.replace(/\s+/g, '_')}.pdf`);
+  };
+
+  const handlePayment = () => {
+    if (!activeOrder || !pricePerKg) return;
+    const price = parseFloat(pricePerKg.toString());
+    const updatedOrder: ClientOrder = {
+      ...activeOrder,
+      pricePerKg: price,
+      status: 'CLOSED',
+      paymentMethod: paymentMethod,
+    };
+    saveOrder(updatedOrder);
+    setActiveOrder(updatedOrder);
+    generateSalesTicketPDF(updatedOrder); // Default to Sales Ticket on payment
+    setShowPaymentModal(false);
+    loadOrders();
+  };
+
+  const totals = getTotals(activeOrder || { records: [] } as any);
+
+  if (!activeOrder) {
+    return (
+      <>
+        <div className="p-4 max-w-7xl mx-auto animate-fade-in text-left">
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4 border-b border-slate-200 pb-6">
+            <div>
+              <h2 className="text-2xl md:text-3xl font-black text-slate-900 uppercase tracking-tighter">Estación de Pesaje</h2>
+              <p className="text-slate-400 text-[10px] font-black uppercase tracking-[0.2em] mt-1 flex items-center gap-2">
+                  <Activity size={12} className="text-blue-600"/> Modo: {mode}
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => generateBatchReportPDF()} className="bg-slate-100 text-slate-700 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-200 transition-all flex items-center gap-3 active:scale-95 border border-slate-200">
+                <FileText size={18} /> Reporte General
+              </button>
+              <button onClick={() => handleOpenClientModal()} className="bg-blue-950 text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl hover:bg-blue-900 transition-all flex items-center gap-3 active:scale-95">
+                <UserPlus size={18} /> Registrar Nuevo Cliente
+              </button>
+            </div>
+          </div>
+          
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            {orders.map(o => {
+                const t = getTotals(o);
+                const isOverLimit = t.qF >= (o.targetCrates || 0);
+                const percent = o.targetCrates ? Math.min((t.qF / o.targetCrates) * 100, 100) : 0;
+
+                return (
+                <div key={o.id} className="bg-white rounded-2xl shadow-lg border border-slate-200 hover:shadow-2xl hover:border-blue-400 transition-all duration-300 overflow-hidden flex flex-col h-full relative group">
+                    <div className="bg-slate-900 p-4 flex justify-between items-start cursor-pointer" onClick={() => setActiveOrder(o)}>
+                       <div className="flex items-center space-x-3">
+                           <div className="bg-blue-600 p-2 rounded-lg text-white shadow-lg">
+                               <User size={24} />
+                           </div>
+                           <div>
+                               <h3 className="font-black text-white text-lg leading-tight truncate max-w-[150px]">{o.clientName}</h3>
+                               <p className="text-slate-400 text-xs font-medium flex items-center mt-1">
+                                   ID: {o.id.slice(-6)}
+                               </p>
+                           </div>
+                       </div>
+                       <div className="flex flex-col items-end gap-2">
+                           <span className={`text-[10px] font-bold px-2 py-1 rounded-lg uppercase tracking-wider ${o.status === 'CLOSED' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                              {o.status === 'CLOSED' ? 'Cerrado' : 'Abierto'}
+                           </span>
+                           <div className="flex gap-1">
+                               <button 
+                                   onClick={(e) => { e.stopPropagation(); handleOpenClientModal(o); }} 
+                                   className="p-1.5 bg-slate-800 text-blue-400 rounded hover:bg-slate-700 transition-colors" 
+                                   title="Editar Cliente"
+                               >
+                                   <Edit2 size={14} />
+                               </button>
+                               <button 
+                                   onClick={(e) => { e.stopPropagation(); handleDeleteClient(o); }} 
+                                   className="p-1.5 bg-slate-800 text-red-400 rounded hover:bg-slate-700 transition-colors" 
+                                   title="Eliminar Cliente"
+                               >
+                                   <Trash2 size={14} />
+                               </button>
+                           </div>
+                       </div>
+                    </div>
+
+                    <div className="p-5 flex-1 flex flex-col justify-between cursor-pointer" onClick={() => setActiveOrder(o)}>
+                        <div>
+                            {/* Progress */}
+                            {o.targetCrates > 0 && (
+                              <div className="mb-6">
+                                  <div className="flex justify-between text-xs font-bold uppercase tracking-wider mb-2">
+                                      <span className="text-slate-500">Meta Jabas</span>
+                                      <span className={`${isOverLimit ? 'text-red-600' : 'text-blue-600'}`}>{t.qF} / {o.targetCrates}</span>
+                                  </div>
+                                  <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden">
+                                      <div className={`h-full rounded-full transition-all duration-500 ${isOverLimit ? 'bg-red-500' : 'bg-gradient-to-r from-blue-500 to-blue-400'}`} style={{ width: `${percent}%` }}></div>
+                                  </div>
+                              </div>
+                            )}
+
+                            <div className="grid grid-cols-2 gap-2 mb-4">
+                                <div className="bg-slate-50 p-2 rounded-xl border border-slate-100">
+                                    <p className="text-[8px] font-bold text-slate-400 uppercase">Bruto</p>
+                                    <p className="font-black text-slate-800 text-sm leading-none">{t.wF.toFixed(1)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2 rounded-xl border border-slate-100">
+                                    <p className="text-[8px] font-bold text-slate-400 uppercase">Tara</p>
+                                    <p className="font-black text-slate-800 text-sm leading-none text-orange-600">-{t.wE.toFixed(1)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2 rounded-xl border border-slate-100">
+                                    <p className="text-[8px] font-bold text-slate-400 uppercase">Merma</p>
+                                    <p className="font-black text-slate-800 text-sm leading-none text-red-600">-{t.wM.toFixed(1)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2 rounded-xl border border-slate-100">
+                                    <p className="text-[8px] font-bold text-slate-400 uppercase">Pollos</p>
+                                    <p className="font-black text-slate-800 text-sm leading-none">{t.bF}</p>
+                                </div>
+                            </div>
+                            <div className="bg-emerald-50 p-3 rounded-xl border border-emerald-100 text-center">
+                                <p className="text-[10px] font-bold text-emerald-600 uppercase">Peso Neto</p>
+                                <p className="font-black text-emerald-700 text-2xl leading-none">{t.net.toFixed(1)} kg</p>
+                            </div>
+                        </div>
+
+                        <div className="flex justify-end gap-2 mt-4">
+                          <div className="bg-blue-50 p-2 rounded-lg text-blue-600 group-hover:bg-blue-600 group-hover:text-white transition-colors">
+                              <ChevronRight size={18} />
+                          </div>
+                        </div>
+                    </div>
+                </div>
+                );
+            })}
+          </div>
+        </div>
+
+        {showClientModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-sm border border-gray-100">
+              <h3 className="text-2xl font-black mb-6 text-slate-900">Nuevo Cliente</h3>
+              <div className="space-y-5">
+                <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1">Nombre del Cliente</label>
+                    <input 
+                        list="client-names"
+                        className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 focus:bg-white outline-none transition-all" 
+                        value={newClientName} 
+                        onChange={e => setNewClientName(e.target.value)} 
+                        placeholder="Ej. Juan Perez" 
+                    />
+                    <datalist id="client-names">
+                        {Array.from(new Set(getOrders().map(o => o.clientName))).map(name => (
+                            <option key={name} value={name} />
+                        ))}
+                    </datalist>
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1">Meta de Jabas</label>
+                    <input 
+                        type="number" 
+                        className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 focus:bg-white outline-none transition-all" 
+                        value={targetCrates} 
+                        onChange={e => setTargetCrates(e.target.value)} 
+                        placeholder="Ej. 100" 
+                    />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1">Pollos por Jaba (Promedio)</label>
+                    <input 
+                        type="number" 
+                        className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 focus:bg-white outline-none transition-all" 
+                        value={newClientBirdsPerCrate} 
+                        onChange={e => setNewClientBirdsPerCrate(e.target.value)} 
+                        placeholder="Ej. 10" 
+                    />
+                </div>
+              </div>
+              <div className="mt-8 flex justify-end space-x-3">
+                <button onClick={() => setShowClientModal(false)} className="text-slate-500 font-bold hover:text-slate-800 px-4 py-2 hover:bg-slate-100 rounded-lg transition-colors">Cancelar</button>
+                <button onClick={handleSaveClient} className="bg-blue-600 text-white px-6 py-2 rounded-xl font-bold shadow-lg hover:bg-blue-700 transition-colors">Crear</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
+    );
+  }
+
+  const isLocked = activeOrder.status === 'CLOSED';
+
+  return (
+    <>
+    <div className="flex flex-col h-full space-y-4 max-w-full mx-auto animate-fade-in text-left pb-10">
+      {/* Header HUD - Rediseñado para mostrar Ojo y Liquidar debajo de totales */}
+      <div className="bg-blue-950 p-3 md:p-4 rounded-[1.5rem] shadow-2xl text-white relative overflow-hidden">
+        <div className="absolute top-0 left-0 w-full h-full opacity-5 pointer-events-none">
+            <Activity size={200} className="scale-150 transform -translate-x-1/4 -translate-y-1/4" />
+        </div>
+        
+        <div className="relative z-10">
+          <div className="flex items-center gap-3 mb-4">
+            <button onClick={() => setActiveOrder(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-all border border-white/10 active:scale-95">
+                <ArrowLeft size={18}/>
+            </button>
+            <div className="flex-1 min-w-0 flex items-center gap-2">
+              <select 
+                  value={activeOrder.id}
+                  onChange={(e) => {
+                      const order = orders.find(o => o.id === e.target.value);
+                      if (order) setActiveOrder(order);
+                  }}
+                  className="bg-transparent text-lg md:text-2xl font-black uppercase leading-none truncate tracking-tighter outline-none cursor-pointer hover:bg-white/10 rounded px-1 -ml-1 transition-colors"
+                  style={{ WebkitAppearance: 'none', MozAppearance: 'none', appearance: 'none' }}
+              >
+                  {orders.map(o => (
+                      <option key={o.id} value={o.id} className="text-slate-900 text-base font-bold">{o.clientName}</option>
+                  ))}
+              </select>
+              <ChevronDown size={16} className="text-blue-300 opacity-50 pointer-events-none -ml-1" />
+            </div>
+          </div>
+          <div className="flex items-center gap-2 mt-1 mb-4">
+            <div className={`w-1.5 h-1.5 rounded-full animate-pulse ${isLocked ? 'bg-red-500' : 'bg-emerald-500'}`}></div>
+            <p className="text-blue-300 text-[8px] md:text-[10px] font-black uppercase tracking-[0.2em] truncate">{isLocked ? 'CONTROL CERRADO' : 'SISTEMA ACTIVO'}</p>
+          </div>
+
+          {/* Counts Row */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5 md:gap-2 mb-1.5 md:mb-2">
+              <div className="bg-blue-500/10 p-1.5 md:p-2 rounded-lg border border-blue-400/20 backdrop-blur-sm">
+                  <p className="text-[7px] font-black text-blue-300 uppercase tracking-widest mb-0.5">Jabas Llenas</p>
+                  <p className="text-lg md:text-xl font-black font-digital text-white">{totals.qF}</p>
+              </div>
+              <div className="bg-blue-400/10 p-1.5 md:p-2 rounded-lg border border-blue-400/20 backdrop-blur-sm">
+                  <p className="text-[7px] font-black text-blue-200 uppercase tracking-widest mb-0.5">Cant. Pollos</p>
+                  <p className="text-lg md:text-xl font-black font-digital text-blue-100">{totals.bF}</p>
+              </div>
+              <div className="bg-orange-500/10 p-1.5 md:p-2 rounded-lg border border-orange-400/20 backdrop-blur-sm">
+                  <p className="text-[7px] font-black text-orange-300 uppercase tracking-widest mb-0.5">Jabas Vacías</p>
+                  <p className="text-lg md:text-xl font-black font-digital text-orange-100">{totals.qE}</p>
+              </div>
+              <div className="bg-red-500/10 p-1.5 md:p-2 rounded-lg border border-red-400/20 backdrop-blur-sm">
+                  <p className="text-[7px] font-black text-red-300 uppercase tracking-widest mb-0.5">Merma (Pollos)</p>
+                  <p className="text-lg md:text-xl font-black font-digital text-red-100">{totals.qM}</p>
+              </div>
+          </div>
+
+          {/* Weights Row */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5 md:gap-2 text-center">
+            <div className="bg-blue-600/20 p-1.5 md:p-2 rounded-lg border border-blue-400/30 backdrop-blur-sm">
+              <p className="text-[7px] font-black text-blue-200 uppercase tracking-widest mb-0.5">Peso Bruto</p>
+              <p className="text-lg md:text-xl font-black font-digital text-white">{totals.wF.toFixed(1)}</p>
+            </div>
+            <div className="bg-orange-600/20 p-1.5 md:p-2 rounded-lg border border-orange-400/30 backdrop-blur-sm">
+              <p className="text-[7px] font-black text-orange-200 uppercase tracking-widest mb-0.5">Peso Tara</p>
+              <p className="text-lg md:text-xl font-black font-digital text-orange-200">-{totals.wE.toFixed(1)}</p>
+            </div>
+            <div className="bg-red-600/20 p-1.5 md:p-2 rounded-lg border border-red-400/30 backdrop-blur-sm">
+              <p className="text-[7px] font-black text-red-200 uppercase tracking-widest mb-0.5">Peso Merma</p>
+              <p className="text-lg md:text-xl font-black font-digital text-red-200">-{totals.wM.toFixed(1)}</p>
+            </div>
+            <div className="bg-emerald-600 p-1.5 md:p-2 rounded-lg shadow-xl shadow-emerald-900/20 border border-emerald-400/50">
+              <p className="text-[7px] font-black text-emerald-100 uppercase tracking-widest mb-0.5">Peso Neto</p>
+              <p className="text-xl md:text-2xl font-black font-digital text-white">{totals.net.toFixed(1)} <span className="text-[8px]">KG</span></p>
+            </div>
+          </div>
+
+          {/* Action Buttons */}
+          <div className="flex flex-row gap-2 mt-4 w-full">
+            <button 
+                type="button"
+                onClick={() => setShowDetailModal(true)}
+                className="flex-1 bg-blue-600 text-white p-3 md:p-4 rounded-xl font-black text-[9px] md:text-xs uppercase tracking-widest shadow-xl hover:bg-blue-500 active:scale-95 transition-all flex items-center justify-center gap-2"
+            >
+                <List size={16} /> <span className="hidden xs:inline">Ver</span> Detalle
+            </button>
+            {!isLocked && (
+                <button 
+                  type="button"
+                  onClick={() => setShowPaymentModal(true)} 
+                  className="flex-[2] bg-white text-blue-950 p-3 md:p-4 rounded-xl font-black text-[9px] md:text-xs uppercase tracking-widest shadow-xl hover:bg-blue-50 active:scale-95 transition-all flex items-center justify-center gap-3"
+                >
+                    <Receipt size={16} /> Liquidar <span className="hidden xs:inline">Operación</span>
+                </button>
+            )}
+             {isLocked && (
+               <button 
+                  type="button"
+                  onClick={() => generateSalesTicketPDF(activeOrder)}
+                  className="flex-[2] bg-emerald-500 text-white p-3 rounded-xl font-black text-[9px] uppercase tracking-widest shadow-xl hover:bg-emerald-400 active:scale-95 transition-all flex items-center justify-center gap-2"
+               >
+                  <Receipt size={16} /> Ticket Venta
+               </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {!isLocked && (
+        <div className="bg-white p-4 md:p-5 rounded-[2rem] shadow-xl border border-slate-100">
+          <div className="flex flex-col md:flex-row gap-4 items-center">
+            <div className="flex bg-slate-100 p-1.5 rounded-2xl gap-1.5 w-full md:w-auto border border-slate-200">
+              <button onClick={() => setActiveTab('FULL')} className={`flex-1 md:w-24 h-16 rounded-xl flex flex-col items-center justify-center gap-1.5 transition-all ${activeTab === 'FULL' ? 'bg-blue-900 text-white shadow-xl' : 'text-slate-400'}`}>
+                <Package size={20}/><span className="text-[8px] font-black uppercase">Llenas</span>
+              </button>
+              <button onClick={() => setActiveTab('EMPTY')} className={`flex-1 md:w-24 h-16 rounded-xl flex flex-col items-center justify-center gap-1.5 transition-all ${activeTab === 'EMPTY' ? 'bg-slate-600 text-white shadow-xl' : 'text-slate-400'}`}>
+                <PackageOpen size={20}/><span className="text-[8px] font-black uppercase">Vacías</span>
+              </button>
+              <button onClick={() => setActiveTab('MORTALITY')} className={`flex-1 md:w-24 h-16 rounded-xl flex flex-col items-center justify-center gap-1.5 transition-all ${activeTab === 'MORTALITY' ? 'bg-red-600 text-white shadow-xl' : 'text-slate-400'}`}>
+                <Bird size={20}/><span className="text-[8px] font-black uppercase">Merma</span>
+              </button>
+            </div>
+            <div className="flex-1 flex gap-3 h-16 w-full">
+              <div className="w-20 bg-slate-50 border-2 border-slate-100 rounded-xl flex flex-col items-center justify-center shadow-inner">
+                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-0.5 leading-none">
+                    {activeTab === 'MORTALITY' ? 'POLLOS' : 'JABAS'}
+                  </span>
+                  <input 
+                    type="number" 
+                    value={qtyInput} 
+                    onChange={e => setQtyInput(e.target.value)} 
+                    className="w-full text-center bg-transparent font-black text-xl outline-none" 
+                    placeholder="0" 
+                  />
+              </div>
+
+              <div className="flex-1 bg-slate-50 border-2 border-slate-100 rounded-xl flex flex-col items-center justify-center shadow-inner">
+                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-0.5 leading-none">PESO (KG)</span>
+                  <input 
+                    ref={weightInputRef} 
+                    type="number" 
+                    value={weightInput} 
+                    onChange={e => setWeightInput(e.target.value)} 
+                    onKeyDown={e => e.key === 'Enter' && addWeight()} 
+                    className="w-full text-center bg-transparent font-black text-2xl md:text-3xl outline-none" 
+                    placeholder="0.00" 
+                    step="0.01"
+                  />
+              </div>
+              <button onClick={addWeight} className="w-20 md:w-32 bg-blue-950 text-white rounded-xl shadow-xl hover:bg-blue-900 transition-all flex items-center justify-center border-b-4 border-blue-800 active:scale-95">
+                  <Save size={24}/>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 flex-1 min-h-[400px]">
+        {['FULL', 'EMPTY', 'MORTALITY'].map(type => (
+          <div key={type} className="bg-white rounded-[2.5rem] border border-slate-200 flex flex-col overflow-hidden shadow-sm">
+            <div className={`p-4 font-black text-[10px] text-center uppercase tracking-[0.2em] text-white flex items-center justify-center gap-2 ${type === 'FULL' ? 'bg-blue-950' : type === 'EMPTY' ? 'bg-slate-600' : 'bg-red-600'}`}>
+              {type === 'FULL' ? 'Lista Brutos' : type === 'EMPTY' ? 'Lista Tara' : 'Lista Merma'}
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50/50">
+              {activeOrder.records.filter(r => r.type === type).map((r, idx) => (
+                <div key={r.id} className="flex justify-between items-center bg-white p-5 rounded-2xl border border-slate-100 shadow-sm transition-all group hover:border-blue-200">
+                  <div className="flex items-center gap-4">
+                    <span className="text-[10px] font-black text-slate-300">#{activeOrder.records.filter(rt => rt.type === type).length - idx}</span>
+                    <p className="font-digital font-black text-slate-800 text-lg md:text-xl">{r.weight.toFixed(2)}</p>
+                  </div>
+                  {!isLocked && <button onClick={() => deleteRecord(r.id)} className="p-2 text-slate-300 hover:text-red-600 transition-all"><Trash2 size={16}/></button>}
+                </div>
+              ))}
+              {activeOrder.records.filter(r => r.type === type).length === 0 && (
+                 <div className="py-10 text-center text-slate-200 font-black uppercase text-[8px] tracking-widest opacity-50">Sin registros</div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+
+      {showPaymentModal && (
+        <div className="fixed inset-0 bg-slate-900/95 backdrop-blur-xl flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-[2rem] p-8 w-full max-w-lg animate-scale-up shadow-2xl border border-slate-100 my-auto">
+            <div className="flex justify-between items-center mb-6">
+                <div className="flex items-center gap-4">
+                    <div className="w-14 h-14 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center">
+                        <Receipt size={28}/>
+                    </div>
+                    <div>
+                        <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tighter">Liquidar Carga</h3>
+                        <p className="text-slate-400 text-[10px] font-black uppercase tracking-[0.2em]">Generación de Ticket Final</p>
+                    </div>
+                </div>
+                <button onClick={() => setShowPaymentModal(false)} className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all">
+                    <X size={24}/>
+                </button>
+            </div>
+            
+            <div className="space-y-6">
+                <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200 shadow-inner">
+                    <div className="grid grid-cols-2 gap-4 mb-6">
+                        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100 text-center">
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Bruto</p>
+                            <p className="font-black text-slate-800 text-xl">{totals.wF.toFixed(1)} kg</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100 text-center">
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Tara</p>
+                            <p className="font-black text-orange-600 text-xl">-{totals.wE.toFixed(1)} kg</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100 text-center">
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Merma</p>
+                            <p className="font-black text-red-600 text-xl">-{totals.wM.toFixed(1)} kg</p>
+                        </div>
+                        <div className="bg-emerald-50 p-4 rounded-xl shadow-sm border border-emerald-200 text-center">
+                            <p className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest mb-1">Peso Neto</p>
+                            <p className="font-black text-emerald-700 text-xl md:text-2xl">{totals.net.toFixed(1)} kg</p>
+                        </div>
+                    </div>
+                    
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 text-center">
+                        <p className="text-[11px] font-black text-slate-500 uppercase tracking-widest mb-2">Monto Total a Pagar</p>
+                        <p className="text-4xl md:text-5xl font-digital font-black text-slate-900">S/. {(totals.net * (parseFloat(pricePerKg.toString()) || 0)).toFixed(2)}</p>
+                    </div>
+                </div>
+                
+                <div className="flex gap-4">
+                    <button 
+                        onClick={() => setPaymentMethod('CASH')}
+                        className={`flex-1 py-4 rounded-xl font-black text-[11px] uppercase tracking-widest border-2 transition-all ${paymentMethod === 'CASH' ? 'border-emerald-500 bg-emerald-50 text-emerald-700 shadow-md' : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-slate-100'}`}
+                    >
+                        Contado
+                    </button>
+                    <button 
+                        onClick={() => setPaymentMethod('CREDIT')}
+                        className={`flex-1 py-4 rounded-xl font-black text-[11px] uppercase tracking-widest border-2 transition-all ${paymentMethod === 'CREDIT' ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-md' : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-slate-100'}`}
+                    >
+                        Crédito
+                    </button>
+                </div>
+
+                <div>
+                    <label className="text-[11px] font-black text-slate-500 uppercase tracking-widest block mb-2 ml-1">Precio por Kilogramo (S/.)</label>
+                    <input type="number" value={pricePerKg} onChange={e => setPricePerKg(e.target.value)} className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-6 py-4 font-black text-xl md:text-2xl outline-none focus:border-emerald-500 focus:bg-white transition-all text-center shadow-inner" placeholder="0.00" step="0.01" autoFocus />
+                </div>
+            </div>
+            <div className="mt-8 flex flex-col gap-3">
+              <button onClick={handlePayment} className="w-full bg-emerald-600 text-white py-4 md:py-5 rounded-xl font-black text-[10px] md:text-xs uppercase tracking-widest shadow-lg shadow-emerald-200 hover:bg-emerald-500 active:scale-95 transition-all flex items-center justify-center gap-2">
+                  <Printer size={16} className="md:w-[18px] md:h-[18px]" /> Confirmar Ticket Venta
+              </button>
+              <button onClick={() => setShowPaymentModal(false)} className="w-full py-4 text-slate-500 font-black text-[11px] uppercase tracking-widest hover:text-slate-800 hover:bg-slate-50 rounded-xl transition-colors">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {orderToDelete && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-sm border border-gray-100 relative">
+            <div className="flex justify-center mb-6">
+                <div className="bg-red-100 p-4 rounded-full text-red-600">
+                    <Trash2 size={32} />
+                </div>
+            </div>
+            <h3 className="text-2xl font-black mb-2 text-slate-900 text-center">Eliminar Cliente</h3>
+            <p className="text-slate-500 text-center text-sm font-medium mb-8">
+                ¿Estás seguro que deseas eliminar a <span className="font-bold text-slate-800">{orderToDelete.clientName}</span>? Esta acción no se puede deshacer.
+            </p>
+            
+            <div className="flex gap-3">
+                <button 
+                    onClick={() => setOrderToDelete(null)} 
+                    className="flex-1 py-4 text-slate-500 font-black text-[11px] uppercase tracking-widest hover:text-slate-800 hover:bg-slate-50 rounded-xl transition-colors border border-slate-200"
+                >
+                    Cancelar
+                </button>
+                <button 
+                    onClick={confirmDeleteClient} 
+                    className="flex-1 bg-red-600 text-white py-4 rounded-xl font-black text-[11px] uppercase tracking-widest shadow-lg shadow-red-200 hover:bg-red-500 active:scale-95 transition-all"
+                >
+                    Eliminar
+                </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showClientModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-sm border border-gray-100">
+              <h3 className="text-2xl font-black mb-6 text-slate-900">Nuevo Cliente</h3>
+              <div className="space-y-5">
+                <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1">Nombre del Cliente</label>
+                    <input 
+                        list="client-names-2"
+                        className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 focus:bg-white outline-none transition-all" 
+                        value={newClientName} 
+                        onChange={e => setNewClientName(e.target.value)} 
+                        placeholder="Ej. Juan Perez" 
+                    />
+                    <datalist id="client-names-2">
+                        {Array.from(new Set(getOrders().map(o => o.clientName))).map(name => (
+                            <option key={name} value={name} />
+                        ))}
+                    </datalist>
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1">Meta de Jabas</label>
+                    <input 
+                        type="number" 
+                        className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 focus:bg-white outline-none transition-all" 
+                        value={targetCrates} 
+                        onChange={e => setTargetCrates(e.target.value)} 
+                        placeholder="Ej. 100" 
+                    />
+                </div>
+                <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1">Pollos por Jaba (Promedio)</label>
+                    <input 
+                        type="number" 
+                        className="w-full bg-slate-50 border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 focus:bg-white outline-none transition-all" 
+                        value={newClientBirdsPerCrate} 
+                        onChange={e => setNewClientBirdsPerCrate(e.target.value)} 
+                        placeholder="Ej. 10" 
+                    />
+                </div>
+              </div>
+              <div className="mt-8 flex justify-end space-x-3">
+                <button onClick={() => setShowClientModal(false)} className="text-slate-500 font-bold hover:text-slate-800 px-4 py-2 hover:bg-slate-100 rounded-lg transition-colors">Cancelar</button>
+                <button onClick={handleSaveClient} className="bg-blue-600 text-white px-6 py-2 rounded-xl font-bold shadow-lg hover:bg-blue-700 transition-colors">Crear</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showDetailModal && activeOrder && (
+            <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center p-4 z-50 backdrop-blur-sm overflow-y-auto">
+                <div className="bg-white rounded-2xl p-8 w-full max-w-4xl shadow-2xl border border-gray-100 my-auto">
+                    <div className="flex justify-between items-start mb-6">
+                        <div className="flex items-center gap-4">
+                            <div className="bg-blue-600 p-3 rounded-xl text-white shadow-lg">
+                                <Eye size={24}/>
+                            </div>
+                            <div>
+                                <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight">Detalle de Carga</h3>
+                                <p className="text-xs text-slate-500 font-bold uppercase tracking-wider mt-1">{activeOrder.clientName}</p>
+                            </div>
+                        </div>
+                        <button onClick={() => setShowDetailModal(false)} className="p-2 bg-slate-100 text-slate-500 hover:text-slate-900 rounded-lg transition-all">
+                            <X size={20}/>
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-8">
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Jabas</p>
+                            <p className="text-xl md:text-2xl font-black text-slate-900">{totals.qF}</p>
+                        </div>
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Pollos</p>
+                            <p className="text-xl md:text-2xl font-black text-blue-600">{totals.bF}</p>
+                        </div>
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Peso Bruto</p>
+                            <p className="text-xl md:text-2xl font-black text-slate-900">{totals.wF.toFixed(2)}</p>
+                        </div>
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Tara Total</p>
+                            <p className="text-xl md:text-2xl font-black text-orange-600">-{totals.wE.toFixed(2)}</p>
+                        </div>
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Merma</p>
+                            <p className="text-xl md:text-2xl font-black text-red-600">-{totals.wM.toFixed(2)}</p>
+                        </div>
+                        <div className="bg-emerald-50 p-4 rounded-xl border border-emerald-200">
+                            <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-1">Peso Final</p>
+                            <p className="text-xl md:text-2xl font-black text-emerald-700">{totals.net.toFixed(2)}</p>
+                        </div>
+                    </div>
+
+                    <div className="space-y-6">
+                        <div className="bg-slate-50 rounded-2xl border border-slate-200 overflow-hidden flex flex-col shadow-sm">
+                            <div className="p-3 font-bold text-[10px] text-center uppercase tracking-widest text-white bg-slate-800">
+                                Desglose de Pesos
+                            </div>
+                            <div className="grid grid-cols-3 divide-x divide-slate-200">
+                                {/* Full Crates */}
+                                <div className="flex flex-col">
+                                    <div className="bg-blue-100 p-2 text-center text-[9px] font-black text-blue-800 uppercase tracking-wider">
+                                        Llenas
+                                    </div>
+                                    <div className="p-2 flex-1 max-h-60 overflow-y-auto space-y-1">
+                                        {activeOrder.records.filter(r => r.type === 'FULL').map((r, i) => (
+                                            <div key={r.id} className="flex justify-between items-center text-[9px] border-b border-slate-100 pb-1 group">
+                                                <span className="text-slate-400 w-6">#{activeOrder.records.filter(rt => rt.type === 'FULL').length - i}</span>
+                                                <span className="font-mono font-bold text-slate-700 flex-1 text-center">{r.weight.toFixed(1)}</span>
+                                                {!isLocked && (
+                                                    <button 
+                                                        onClick={() => deleteRecord(r.id)}
+                                                        className="text-slate-300 hover:text-red-500 transition-colors opacity-100 md:opacity-0 md:group-hover:opacity-100 p-1"
+                                                        title="Eliminar"
+                                                    >
+                                                        <Trash2 size={12} />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="bg-slate-50 p-2 border-t border-slate-200 text-center">
+                                        <p className="text-[8px] font-bold text-slate-400 uppercase">Total</p>
+                                        <p className="font-black text-slate-800 text-sm">{totals.wF.toFixed(1)}</p>
+                                    </div>
+                                </div>
+
+                                {/* Empty Crates */}
+                                <div className="flex flex-col">
+                                    <div className="bg-slate-200 p-2 text-center text-[9px] font-black text-slate-700 uppercase tracking-wider">
+                                        Vacías
+                                    </div>
+                                    <div className="p-2 flex-1 max-h-60 overflow-y-auto space-y-1">
+                                        {activeOrder.records.filter(r => r.type === 'EMPTY').map((r, i) => (
+                                            <div key={r.id} className="flex justify-between items-center text-[9px] border-b border-slate-100 pb-1 group">
+                                                <span className="text-slate-400 w-6">#{activeOrder.records.filter(rt => rt.type === 'EMPTY').length - i}</span>
+                                                <span className="font-mono font-bold text-slate-700 flex-1 text-center">{r.weight.toFixed(1)}</span>
+                                                {!isLocked && (
+                                                    <button 
+                                                        onClick={() => deleteRecord(r.id)}
+                                                        className="text-slate-300 hover:text-red-500 transition-colors opacity-100 md:opacity-0 md:group-hover:opacity-100 p-1"
+                                                        title="Eliminar"
+                                                    >
+                                                        <Trash2 size={12} />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="bg-slate-50 p-2 border-t border-slate-200 text-center">
+                                        <p className="text-[8px] font-bold text-slate-400 uppercase">Total</p>
+                                        <p className="font-black text-orange-600 text-sm">-{totals.wE.toFixed(1)}</p>
+                                    </div>
+                                </div>
+
+                                {/* Mortality */}
+                                <div className="flex flex-col">
+                                    <div className="bg-red-100 p-2 text-center text-[9px] font-black text-red-800 uppercase tracking-wider">
+                                        Merma
+                                    </div>
+                                    <div className="p-2 flex-1 max-h-60 overflow-y-auto space-y-1">
+                                        {activeOrder.records.filter(r => r.type === 'MORTALITY').map((r, i) => (
+                                            <div key={r.id} className="flex justify-between items-center text-[9px] border-b border-slate-100 pb-1 group">
+                                                <span className="text-slate-400 w-6">#{activeOrder.records.filter(rt => rt.type === 'MORTALITY').length - i}</span>
+                                                <span className="font-mono font-bold text-slate-700 flex-1 text-center">{r.weight.toFixed(1)}</span>
+                                                {!isLocked && (
+                                                    <button 
+                                                        onClick={() => deleteRecord(r.id)}
+                                                        className="text-slate-300 hover:text-red-500 transition-colors opacity-100 md:opacity-0 md:group-hover:opacity-100 p-1"
+                                                        title="Eliminar"
+                                                    >
+                                                        <Trash2 size={12} />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="bg-slate-50 p-2 border-t border-slate-200 text-center">
+                                        <p className="text-[8px] font-bold text-slate-400 uppercase">Total</p>
+                                        <p className="font-black text-red-600 text-sm">-{totals.wM.toFixed(1)}</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="mt-8 flex flex-col md:flex-row gap-4 justify-end border-t border-slate-100 pt-6">
+                        <button 
+                            onClick={() => generateWeighingTicketPDF(activeOrder)}
+                            className="w-full md:w-auto bg-white text-slate-900 border-2 border-slate-200 px-4 md:px-6 py-3 rounded-xl font-black text-[10px] md:text-xs uppercase tracking-widest flex justify-center items-center gap-2 hover:bg-slate-50 transition-all shadow-sm active:scale-95"
+                        >
+                            <Printer size={16} className="md:w-[18px] md:h-[18px]" /> Ticket Carga
+                        </button>
+                        <button 
+                            onClick={() => generateSalesTicketPDF(activeOrder)}
+                            className="w-full md:w-auto bg-slate-900 text-white px-4 md:px-6 py-3 rounded-xl font-black text-[10px] md:text-xs uppercase tracking-widest flex justify-center items-center gap-2 hover:bg-slate-800 transition-all shadow-lg active:scale-95"
+                        >
+                            <Receipt size={16} className="md:w-[18px] md:h-[18px]" /> Ticket Venta
+                        </button>
+                        <button 
+                            onClick={() => generateDetailPDF(activeOrder)}
+                            className="w-full md:w-auto bg-blue-600 text-white px-4 md:px-6 py-3 rounded-xl font-black text-[10px] md:text-xs uppercase tracking-widest flex justify-center items-center gap-2 hover:bg-blue-500 transition-all shadow-lg shadow-blue-200 active:scale-95"
+                        >
+                            <Download size={16} className="md:w-[18px] md:h-[18px]" /> Reporte A4
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
+    </>
+  );
+};
+
+export default WeighingStation;
