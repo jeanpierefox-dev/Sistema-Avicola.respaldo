@@ -26,6 +26,7 @@ const WeighingStation: React.FC = () => {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
   
+  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [editingOrderId, setEditingOrderId] = useState<string | null>(null);
   const [newClientName, setNewClientName] = useState('');
   const [targetCrates, setTargetCrates] = useState<string>(''); 
@@ -59,6 +60,12 @@ const WeighingStation: React.FC = () => {
       ? all.filter(o => o.batchId === batchId) 
       : all.filter(o => !o.batchId && o.weighingMode === mode);
     
+    // Date Filtering
+    filtered = filtered.filter(o => {
+        const orderDate = new Date(parseInt(o.id)).toISOString().split('T')[0];
+        return orderDate === selectedDate;
+    });
+
     if (user?.role !== UserRole.ADMIN) {
       filtered = filtered.filter(o => !o.createdBy || o.createdBy === user?.id);
     }
@@ -68,8 +75,16 @@ const WeighingStation: React.FC = () => {
   };
 
   const setDefaultQuantity = () => {
-    if (mode === WeighingType.SOLO_POLLO) { setQtyInput('10'); setBirdsPerCrate('1'); }
-    else if (mode === WeighingType.SOLO_JABAS) { setQtyInput('1'); setBirdsPerCrate('0'); }
+    if (mode === WeighingType.SOLO_POLLO) { 
+        setQtyInput('10'); 
+        setBirdsPerCrate('10'); 
+        setActiveTab('FULL');
+    }
+    else if (mode === WeighingType.SOLO_JABAS) { 
+        setQtyInput('1'); 
+        setBirdsPerCrate('0'); 
+        setActiveTab('MORTALITY');
+    }
     else {
       if (activeTab === 'FULL') { 
         setQtyInput(config.defaultFullCrateBatch.toString()); 
@@ -182,7 +197,7 @@ const WeighingStation: React.FC = () => {
     // If birds property exists, use it. Otherwise fallback to quantity * 10 (legacy) or just quantity if SOLO_POLLO
     const bF = full.reduce((a, b) => a + (b.birds !== undefined ? b.birds : (order.weighingMode === WeighingType.SOLO_POLLO ? b.quantity : b.quantity * 10)), 0);
     
-    const net = order.weighingMode === WeighingType.SOLO_POLLO ? wF : wF - wE - wM;
+    const net = order.weighingMode === WeighingType.SOLO_POLLO ? wF : (order.weighingMode === WeighingType.SOLO_JABAS ? wM : wF - wE - wM);
     
     // Count of weights (records)
     const cF = full.length;
@@ -669,7 +684,7 @@ const WeighingStation: React.FC = () => {
     y += 10;
 
     // Table Data Preparation
-    const tableData = batchOrders.map((order: ClientOrder) => {
+    const tableData: any[][] = batchOrders.map((order: ClientOrder) => {
         const t = getTotals(order);
         const price = order.pricePerKg || 0;
         const totalAmount = t.net * price;
@@ -770,14 +785,27 @@ const WeighingStation: React.FC = () => {
             <div>
               <h2 className="text-2xl md:text-3xl font-black text-slate-900 uppercase tracking-tighter">Estación de Pesaje</h2>
               <p className="text-slate-400 text-[10px] font-black uppercase tracking-[0.2em] mt-1 flex items-center gap-2">
-                  <Activity size={12} className="text-blue-600"/> Modo: {mode}
+                  <Activity size={12} className="text-blue-600"/> Modo: {mode === WeighingType.SOLO_JABAS ? 'POLLOS MUERTOS' : mode}
               </p>
             </div>
-            <div className="flex gap-3">
-              <button onClick={() => generateBatchReportPDF()} className="bg-slate-100 text-slate-700 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-200 transition-all flex items-center gap-3 active:scale-95 border border-slate-200">
+            <div className="flex flex-wrap gap-3">
+              <div className="flex flex-col">
+                  <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Filtrar por Fecha</label>
+                  <input 
+                    type="date" 
+                    value={selectedDate} 
+                    onChange={(e) => {
+                        setSelectedDate(e.target.value);
+                        // Delay load to ensure state update
+                        setTimeout(loadOrders, 0);
+                    }}
+                    className="bg-white border-2 border-slate-200 rounded-xl px-4 py-3 font-bold text-slate-900 focus:border-blue-500 outline-none transition-all shadow-sm"
+                  />
+              </div>
+              <button onClick={() => generateBatchReportPDF()} className="bg-slate-100 text-slate-700 px-6 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-sm hover:bg-slate-200 transition-all flex items-center gap-3 active:scale-95 border border-slate-200 self-end">
                 <FileText size={18} /> Reporte General
               </button>
-              <button onClick={() => handleOpenClientModal()} className="bg-blue-950 text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl hover:bg-blue-900 transition-all flex items-center gap-3 active:scale-95">
+              <button onClick={() => handleOpenClientModal()} className="bg-blue-950 text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl hover:bg-blue-900 transition-all flex items-center gap-3 active:scale-95 self-end">
                 <UserPlus size={18} /> Registrar Nuevo Cliente
               </button>
             </div>
@@ -1041,7 +1069,7 @@ const WeighingStation: React.FC = () => {
       {!isLocked && (
         <div className="bg-white p-4 md:p-5 rounded-[2rem] shadow-xl border border-slate-100">
           <div className="flex flex-col md:flex-row gap-4 items-center">
-            <div className="flex bg-slate-100 p-1.5 rounded-2xl gap-1.5 w-full md:w-auto border border-slate-200">
+            <div className={`flex bg-slate-100 p-1.5 rounded-2xl gap-1.5 w-full md:w-auto border border-slate-200 ${mode === WeighingType.SOLO_POLLO || mode === WeighingType.SOLO_JABAS ? 'hidden md:hidden' : ''}`}>
               <button onClick={() => setActiveTab('FULL')} className={`flex-1 md:w-24 h-16 rounded-xl flex flex-col items-center justify-center gap-1.5 transition-all ${activeTab === 'FULL' ? 'bg-blue-900 text-white shadow-xl' : 'text-slate-400'}`}>
                 <Package size={20}/><span className="text-[8px] font-black uppercase">Llenas</span>
               </button>
@@ -1052,10 +1080,23 @@ const WeighingStation: React.FC = () => {
                 <Bird size={20}/><span className="text-[8px] font-black uppercase">Merma</span>
               </button>
             </div>
+            
+            {mode === WeighingType.SOLO_POLLO && (
+                <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 rounded-xl border border-amber-200 text-amber-700 font-black text-[10px] uppercase tracking-widest mr-auto">
+                    <Bird size={16}/> Solo Venta Pollo Vivo
+                </div>
+            )}
+
+            {mode === WeighingType.SOLO_JABAS && (
+                <div className="flex items-center gap-2 px-4 py-2 bg-red-50 rounded-xl border border-red-200 text-red-700 font-black text-[10px] uppercase tracking-widest mr-auto">
+                    <Activity size={16}/> Solo Registro de Muertos
+                </div>
+            )}
+
             <div className="flex-1 flex gap-3 h-16 w-full">
               <div className="w-20 bg-slate-50 border-2 border-slate-100 rounded-xl flex flex-col items-center justify-center shadow-inner">
-                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-0.5 leading-none">
-                    {activeTab === 'MORTALITY' ? 'POLLOS' : 'JABAS'}
+                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-0.5 leading-none px-1 text-center">
+                    {mode === WeighingType.SOLO_POLLO ? 'CANT. SACOS' : (activeTab === 'MORTALITY' ? 'POLLOS' : 'JABAS')}
                   </span>
                   <input 
                     type="number" 
@@ -1065,6 +1106,19 @@ const WeighingStation: React.FC = () => {
                     placeholder="0" 
                   />
               </div>
+
+              {mode === WeighingType.SOLO_POLLO && (
+                <div className="w-20 bg-slate-50 border-2 border-slate-100 rounded-xl flex flex-col items-center justify-center shadow-inner">
+                    <span className="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-0.5 leading-none px-1 text-center">POLLOS X SACO</span>
+                    <input 
+                      type="number" 
+                      value={birdsPerCrate} 
+                      onChange={e => setBirdsPerCrate(e.target.value)} 
+                      className="w-full text-center bg-transparent font-black text-xl outline-none" 
+                      placeholder="0" 
+                    />
+                </div>
+              )}
 
               <div className="flex-1 bg-slate-50 border-2 border-slate-100 rounded-xl flex flex-col items-center justify-center shadow-inner">
                   <span className="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-0.5 leading-none">PESO (KG)</span>
@@ -1088,8 +1142,12 @@ const WeighingStation: React.FC = () => {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 flex-1 min-h-[400px]">
-        {['FULL', 'EMPTY', 'MORTALITY'].map(type => (
-          <div key={type} className="bg-white rounded-[2.5rem] border border-slate-200 flex flex-col overflow-hidden shadow-sm">
+        {['FULL', 'EMPTY', 'MORTALITY'].filter(type => {
+            if (mode === WeighingType.SOLO_POLLO) return type === 'FULL';
+            if (mode === WeighingType.SOLO_JABAS) return type === 'MORTALITY';
+            return true;
+        }).map(type => (
+          <div key={type} className={`bg-white rounded-[2.5rem] border border-slate-200 flex flex-col overflow-hidden shadow-sm ${mode === WeighingType.SOLO_POLLO || mode === WeighingType.SOLO_JABAS ? 'md:col-start-2' : ''}`}>
             <div className={`p-4 font-black text-[10px] text-center uppercase tracking-[0.2em] text-white flex items-center justify-center gap-2 ${type === 'FULL' ? 'bg-blue-950' : type === 'EMPTY' ? 'bg-slate-600' : 'bg-red-600'}`}>
               {type === 'FULL' ? 'Lista Brutos' : type === 'EMPTY' ? 'Lista Tara' : 'Lista Merma'}
             </div>

@@ -135,11 +135,11 @@ const Dashboard: React.FC = () => {
               mode={WeighingType.SOLO_POLLO}
             />
             <MenuCard
-              title="Control de Jabas"
-              desc="Despacho por unidades. Calcula el peso estimado basado en promedios."
+              title="Pesaje Pollos Muertos"
+              desc="Registro exclusivo para el control de mortalidad. Permite pesar pollos de descarte."
               icon={<Box size={26} />}
               onClick={() => navigate(`/weigh/${WeighingType.SOLO_JABAS}`)}
-              color="bg-emerald-600"
+              color="bg-red-600"
               roles={[UserRole.ADMIN, UserRole.GENERAL, UserRole.OPERATOR]}
               mode={WeighingType.SOLO_JABAS}
             />
